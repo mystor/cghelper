@@ -1,0 +1,7 @@
+[package]
+name = "cghelper"
+description = "A utility crate for writing code generators"
+version = "0.1.0"
+authors = ["Nika Layzell <nika@thelayzells.com>"]
+
+[dependencies]
