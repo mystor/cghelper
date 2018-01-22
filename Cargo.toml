@@ -5,3 +5,4 @@ version = "0.1.0"
 authors = ["Nika Layzell <nika@thelayzells.com>"]
 
 [dependencies]
+ansi_term = "0.10"

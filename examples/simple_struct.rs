@@ -45,8 +45,8 @@ fn main() {
         Struct {
             name: "celery",
             fields: &[
-                ("a", "uint32_t"),
-                ("b", "char*"),
+                ("c", "bool"),
+                ("d", "std::string"),
             ],
         }
     ];
@@ -67,7 +67,6 @@ fn main() {
         structs: struct_code,
     );
 
-    println!("code = {:#?}", code);
-
-    println!("{}", code);
+    println!("Debug Output:\n{:#?}\n", code);
+    println!("Display Output:\n{}", code);
 }

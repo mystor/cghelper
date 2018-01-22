@@ -1,20 +1,77 @@
-use std::fmt;
-use std::iter::FromIterator;
-
-mod display;
-
-// XXX(todo): Consider providing an option to discover where a piece of the
-// output code is coming from in your code. Potentially a method which performs
-// debug printing but with annotations about what line/column produced each
-// part?
+extern crate ansi_term;
 
 // Not a public API
 #[doc(hidden)]
-#[derive(Debug)]
-pub struct SourceLoc {
-    pub line: u32,
-    pub column: u32,
-    pub file: &'static str,
+pub use std::sync::atomic::ATOMIC_USIZE_INIT;
+use std::sync::atomic::AtomicUsize;
+
+use std::fmt;
+use std::iter::FromIterator;
+use std::cmp;
+use std::hash;
+
+mod display;
+mod colours;
+mod codearg;
+
+pub use codearg::CodeArg;
+
+/// Mechanism for constructing a [`Code`] object. This macro takes a string
+/// literal as its first argument, with `$substitutions`, and a series of
+/// substitutions as the remaining arguments. Those substitutions can be
+/// anything which implements the [`CodeArg`] trait.
+///
+/// [`Code`]: struct.Code.html
+/// [`CodeArg`]: trait.CodeArg.html
+///
+/// # Example Usage
+///
+/// ```
+/// # #[macro_use] extern crate cghelper;
+/// # fn main() {
+/// let body = code!(r#"
+///     printf("This is the end of the world as we know it,\n");
+///     printf("And my god it is starting to show it!\n");
+/// "#);
+///
+/// let res = code!("
+///     if ($cond) {
+///         $body
+///     }",
+///     cond: "x == 5",
+///     body: body,
+/// );
+///
+/// assert_eq!(
+///     res.to_string(),
+///     "\
+/// if (x == 5) {
+///     printf(\"This is the end of the world as we know it,\\n\");
+///     printf(\"And my god it is starting to show it!\\n\");
+/// }"
+/// );
+/// # }
+/// ```
+#[macro_export]
+macro_rules! code {
+    ($e:expr) => { code!($e,) };
+    ($e:expr, $($i:ident : $v:expr),* $(,)*) => {
+        {
+            static LOC: $crate::SourceLoc = $crate::SourceLoc {
+                line: line!(),
+                column: column!(),
+                file: file!(),
+                colour: $crate::ATOMIC_USIZE_INIT,
+            };
+
+            $crate::Code::build(
+                $e, &LOC,
+                &mut [ $(
+                    $crate::BuildArg::new(stringify!($i), $v)
+                ),* ]
+            )
+        }
+    };
 }
 
 /// Internal datastructure used to represent how to construct a particular chunk
@@ -26,10 +83,10 @@ enum Op {
     Nl,
     /// A string literal containing no newlines.
     Lit(&'static str),
-    /// A dynamic blob, containing no newlines.
+    /// A dynamic blob, containing no newlines - `Box<str>` to keep `Op` small.
     Blob(Box<str>),
 
-    /// An embedded `Code` object.
+    /// An embedded `Code` object - `Box<[Op]>` to keep `Op` small.
     Inner(Box<[Op]>),
     /// A reference to another `Code` object which is being repeated.
     ///
@@ -41,76 +98,117 @@ enum Op {
     SourceLoc(&'static SourceLoc),
 }
 
+/// This struct represents a chunk of code.
 ///
+/// Use the `Display` implementation on this type to transform your code into a
+/// string output.
+///
+/// The "alternate" `Debug` implementation (enabled by using `"{:#?}"` in the
+/// format string) on this type will be colorized to help with visualizing the
+/// source of each piece of code.
+///
+/// # Example
+///
+/// ```
+/// # #[macro_use] extern crate cghelper;
+/// # fn main() {
+/// let hello = code!("Hello");
+/// let world = code!("World");
+/// let result = code!("$hello, $world!", hello: hello, world: world);
+/// println!("{:#?}", result);
+/// # }
+/// ```
 #[cfg_attr(cghelper_internal_debug, derive(Debug))]
 #[derive(Clone)]
 pub struct Code {
     ops: Vec<Op>
 }
 
+impl Code {
+    /// Create a new `Code` object containing no code.
+    pub fn new() -> Self {
+        Code { ops: vec![] }
+    }
+
+    /// Append the given [`CodeArg`].
+    ///
+    /// [`CodeArg`]: struct.CodeArg.html
+    pub fn push<T: CodeArg>(&mut self, v: T) {
+        self.ops.extend(v.into_code().ops)
+    }
+
+    // Not a public API - use code! instead.
+    #[doc(hidden)]
+    pub fn build(
+        tmpl: &'static str,
+        sourceloc: &'static SourceLoc,
+        args: &mut [BuildArg],
+    ) -> Self {
+        str_to_code(tmpl, Some(sourceloc), Some(args), Op::Lit)
+    }
+}
+
+impl<T> FromIterator<T> for Code
+where
+    T: CodeArg
+{
+    fn from_iter<I>(i: I) -> Code
+    where
+        I: IntoIterator<Item=T>,
+    {
+        let mut i = i.into_iter();
+        let mut c = i.next()
+            .map(|x| x.into_code())
+            .unwrap_or(Code::new());
+        for x in i { c.push(x); }
+        c
+    }
+}
+
 #[cfg(not(cghelper_internal_debug))]
 impl fmt::Debug for Code {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Code {{{}}}", self)
-    }
-}
-
-#[doc(hidden)]
-pub trait CodeArg {
-    fn into_code(self) -> Code;
-}
-
-impl CodeArg for Code {
-    fn into_code(self) -> Code {
-        self
-    }
-}
-
-impl CodeArg for bool {
-    fn into_code(self) -> Code {
-        Code {
-             ops: vec![ Op::Lit(if self { "true" } else { "false" }) ]
-        }
-    }
-}
-
-impl CodeArg for String {
-    fn into_code(self) -> Code {
-        // We won't be performing any transformations on this buffer, so let's
-        // just save the string directly.
-        if !self.contains('\n') && self.chars().map(char::is_whitespace).next().unwrap_or(false) {
-            Code {
-                ops: vec![ Op::Blob(self.into_boxed_str()) ],
-            }
+        if f.alternate() {
+            f.write_str("Code {\n")?;
+            display::do_display(self, f, 4, true)?;
+            f.write_str("\n}")
         } else {
-            (&self[..]).into_code()
+            f.write_str("Code {")?;
+            display::do_display(self, f, 0, false)?;
+            f.write_str("}")
         }
     }
 }
 
-impl<'a> CodeArg for &'a str {
-    fn into_code(self) -> Code {
-        str_to_code(
-            self,
-            None,
-            None,
-            |s| Op::Blob(s.to_owned().into_boxed_str()),
-        )
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        display::do_display(self, f, 0, false)
     }
 }
 
-macro_rules! codearg_display {($($i:ident),*) => {
-    $( impl CodeArg for $i {
-        fn into_code(self) -> Code {
-            // We know that the strings won't contain '\n' or any leading
-            // whitespace, so we can skip that test.
-            Code {
-                ops: vec![ Op::Blob(self.to_string().into_boxed_str()) ],
-            }
-        }
-    } )*
-}}
-codearg_display! { i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 }
+// Not a public API
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct SourceLoc {
+    pub line: u32,
+    pub column: u32,
+    pub file: &'static str,
+    pub colour: AtomicUsize,
+}
+
+// NOTE: We want to compare SourceLoc objects by pointer, so we need custom hash
+// and eq definitions.
+impl cmp::PartialEq for SourceLoc {
+    fn eq(&self, other: &Self) -> bool {
+        self as *const Self == other as *const Self
+    }
+}
+impl cmp::Eq for SourceLoc {}
+impl hash::Hash for SourceLoc {
+    fn hash<H: hash::Hasher>(&self, h: &mut H) {
+        (self as *const Self).hash(h)
+    }
+}
 
 /// Simple helper function to count the number of instances of a particular
 /// character in a string. This is used to pre-allocate sufficiently large
@@ -199,7 +297,7 @@ where
     // re-allocate our backing buffer.
     let mut estimate = count_char(tmpl, '\n') * 2 + 1;
     if args.is_some() {
-        estimate += count_char(tmpl, '$');
+        estimate += count_char(tmpl, '$') * 2;
     }
     if sourceloc.is_some() {
         estimate += 1;
@@ -253,95 +351,4 @@ where
 
     debug_assert!(estimate >= ops.len());
     Code { ops }
-}
-
-impl Code {
-    pub fn new() -> Self {
-        Code { ops: vec![] }
-    }
-
-    pub fn push<T: CodeArg>(&mut self, v: T) {
-        self.ops.extend(v.into_code().ops)
-    }
-
-    // Not a public API - use code! instead.
-    #[doc(hidden)]
-    pub fn build(
-        tmpl: &'static str,
-        sourceloc: &'static SourceLoc,
-        args: &mut [BuildArg],
-    ) -> Self {
-        str_to_code(tmpl, Some(sourceloc), Some(args), Op::Lit)
-    }
-}
-
-/// Mechanism for constructing a [`Code`] object. This macro takes a string
-/// literal as its first argument, with `$substitutions`, and a series of
-/// substitutions as the remaining arguments. Those substitutions can be
-/// anything which implements the [`CodeArg`] trait.
-///
-/// # Example Usage
-///
-/// ```
-/// # #[macro_use] extern crate cghelper;
-/// # fn main() {
-/// let body = code!(r#"
-///     printf("This is the end of the world as we know it,\n");
-///     printf("And my god it is starting to show it!\n");
-/// "#);
-///
-/// let res = code!("
-///     if ($cond) {
-///         $body
-///     }",
-///     cond: "x == 5",
-///     body: body,
-/// );
-///
-/// assert_eq!(
-///     res.to_string(),
-///     "\
-/// if (x == 5) {
-///     printf(\"This is the end of the world as we know it,\\n\");
-///     printf(\"And my god it is starting to show it!\\n\");
-/// }"
-/// );
-/// # }
-/// ```
-#[macro_export]
-macro_rules! code {
-    ($e:expr) => { code!($e,) };
-    ($e:expr, $($i:ident : $v:expr),* $(,)*) => {
-        {
-            static LOC: $crate::SourceLoc = $crate::SourceLoc {
-                line: line!(),
-                column: column!(),
-                file: file!(),
-            };
-
-            $crate::Code::build(
-                $e, &LOC,
-                &mut [ $(
-                    $crate::BuildArg::new(stringify!($i), $v)
-                ),* ]
-            )
-        }
-    };
-}
-
-impl<T> FromIterator<T> for Code
-where
-    T: CodeArg
-{
-    fn from_iter<I>(i: I) -> Code
-    where
-        I: IntoIterator<Item=T>,
-    {
-        let mut i = i.into_iter();
-        let mut c = i.next()
-            .map(|x| x.into_code())
-            .unwrap_or(Code::new());
-        for x in i { c.push(x); }
-        c
-    }
 }
